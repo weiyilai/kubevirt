@@ -4,7 +4,7 @@ package v1
 
 func (VirtualMachineInstance) SwaggerDoc() map[string]string {
 	return map[string]string{
-		"":       "VirtualMachineInstance is *the* VirtualMachineInstance Definition. It represents a virtual machine in the runtime environment of kubernetes.\n\n+k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object\n+genclient",
+		"":       "VirtualMachineInstance is *the* VirtualMachineInstance Definition. It represents a virtual machine in the runtime environment of kubernetes.\n\n+k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object\n+genclient\n+genclient:noStatus",
 		"spec":   "VirtualMachineInstance Spec contains the VirtualMachineInstance specification.",
 		"status": "Status is the high level overview of how the VirtualMachineInstance is doing. It contains information available to controllers and users.",
 	}
@@ -1141,5 +1141,21 @@ func (SEVSecretOptions) SwaggerDoc() map[string]string {
 		"":       "SEVSecretOptions is used to provide a secret for a running guest.",
 		"header": "Base64 encoded header needed to decrypt the secret.",
 		"secret": "Base64 encoded encrypted launch secret.",
+	}
+}
+
+func (ObjectGraphNode) SwaggerDoc() map[string]string {
+	return map[string]string{
+		"":         "ObjectGraphNode represents an individual node in the graph.\n\n+k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object",
+		"optional": "+optional",
+		"children": "+listType=atomic",
+	}
+}
+
+func (ObjectGraphOptions) SwaggerDoc() map[string]string {
+	return map[string]string{
+		"":                     "ObjectGraphOptions holds options for the object graph.",
+		"includeOptionalNodes": "IncludeOptionalNodes indicates whether to include optional nodes in the graph.\nTrue by default.",
+		"labelSelector":        "LabelSelector is used to filter nodes in the graph based on their labels.",
 	}
 }

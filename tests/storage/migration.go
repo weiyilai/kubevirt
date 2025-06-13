@@ -75,7 +75,7 @@ import (
 	"kubevirt.io/kubevirt/tests/testsuite"
 )
 
-var _ = Describe(SIG("Volumes update with migration", decorators.RequiresTwoSchedulableNodes, decorators.VMLiveUpdateRolloutStrategy, Serial, func() {
+var _ = Describe(SIG("Volumes update with migration", decorators.RequiresTwoSchedulableNodes, decorators.VMLiveUpdateRolloutStrategy, func() {
 	var virtClient kubecli.KubevirtClient
 	var testSc string
 	getCSIStorageClass := libstorage.GetSnapshotStorageClass
@@ -909,19 +909,13 @@ var _ = Describe(SIG("Volumes update with migration", decorators.RequiresTwoSche
 	})
 
 	Context("Hotplug volumes", func() {
-		var fgDisabled bool
-		BeforeEach(func() {
-			fgDisabled = !checks.HasFeature(featuregate.HotplugVolumesGate)
-			if fgDisabled {
+
+		enableLegacyHotplug := func() {
+			// even if DeclarativeHotplugVolumesGate is enabled this takes precedence
+			if !checks.HasFeature(featuregate.HotplugVolumesGate) {
 				config.EnableFeatureGate(featuregate.HotplugVolumesGate)
 			}
-
-		})
-		AfterEach(func() {
-			if fgDisabled {
-				config.DisableFeatureGate(featuregate.HotplugVolumesGate)
-			}
-		})
+		}
 
 		waitForHotplugVol := func(vmName, ns, volName string) {
 			Eventually(func() string {
@@ -938,6 +932,11 @@ var _ = Describe(SIG("Volumes update with migration", decorators.RequiresTwoSche
 
 		DescribeTable("should be able to add and remove a volume with the volume migration feature gate enabled", func(persist bool) {
 			const volName = "vol0"
+
+			if !persist {
+				enableLegacyHotplug()
+			}
+
 			ns := testsuite.GetTestNamespace(nil)
 			dv := createBlankDV(virtClient, ns, "1Gi")
 			vmi := libvmifact.NewCirros(
@@ -1004,7 +1003,7 @@ var _ = Describe(SIG("Volumes update with migration", decorators.RequiresTwoSche
 			)
 		},
 			Entry("with a persistent volume", true),
-			Entry("with an ephemeral volume", false),
+			Entry("with an ephemeral volume", Serial, false),
 		)
 
 		Context("should be able to volume migrate a VM", func() {
@@ -1135,7 +1134,12 @@ var _ = Describe(SIG("Volumes update with migration", decorators.RequiresTwoSche
 					libvmi.WithNamespace(ns),
 					libvmi.WithInterface(libvmi.InterfaceDeviceWithMasqueradeBinding()),
 					libvmi.WithNetwork(virtv1.DefaultPodNetwork()),
-					libvmi.WithResourceMemory("128Mi"),
+					// CPU manager clashes with hotplugging close to boot time, overriding the allowed hotplug volume
+					// For testing purposes, we're okay with using guaranteed QoS, which ensures CPU set gets set on boot
+					// But really this is a bug in the way that our allowed device list could get overriden
+					// https://github.com/kubevirt/kubevirt/issues/14825
+					libvmi.WithResourceCPU("1"), libvmi.WithResourceMemory("128Mi"),
+					libvmi.WithLimitCPU("1"), libvmi.WithLimitMemory("128Mi"),
 					libvmi.WithDataVolume(rootVolName, rootDV.Name),
 					libvmi.WithCloudInitNoCloud(libvmifact.WithDummyCloudForFastBoot()),
 				)

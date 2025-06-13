@@ -77,6 +77,18 @@ const (
 	VirtIOFSStorageVolumeGate = "EnableVirtioFsStorageVolumes"
 
 	DecentralizedLiveMigration = "DecentralizedLiveMigration"
+
+	// Owner: sig-storage / @alromeros
+	// Alpha: v1.6.0
+	//
+	// ObjectGraph introduces a new subresource for VMs and VMIs.
+	// This subresource returns a structured list of k8s objects that are related
+	// to the specified VM or VMI, enabling better dependency tracking.
+	ObjectGraph = "ObjectGraph"
+
+	// DeclarativeHotplugVolumes enables adding/removing volumes declaratively
+	// also implicitly handles inject/eject CDROM
+	DeclarativeHotplugVolumesGate = "DeclarativeHotplugVolumes"
 )
 
 func init() {
@@ -104,4 +116,5 @@ func init() {
 	RegisterFeatureGate(FeatureGate{Name: VirtIOFSConfigVolumesGate, State: Alpha})
 	RegisterFeatureGate(FeatureGate{Name: VirtIOFSStorageVolumeGate, State: Alpha})
 	RegisterFeatureGate(FeatureGate{Name: DecentralizedLiveMigration, State: Alpha})
+	RegisterFeatureGate(FeatureGate{Name: DeclarativeHotplugVolumesGate, State: Alpha})
 }
