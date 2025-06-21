@@ -26,6 +26,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	k8sv1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -428,6 +429,8 @@ func (c *Controller) updateStatus(vmi *virtv1.VirtualMachineInstance, pod *k8sv1
 			c.syncVolumesUpdate(vmiCopy)
 		}
 
+		c.syncMigrationRequiredCondition(vmiCopy)
+
 	case vmi.IsScheduled():
 		if !vmiPodExists {
 			vmiCopy.Status.Phase = virtv1.Failed
@@ -467,7 +470,7 @@ func (c *Controller) updateStatus(vmi *virtv1.VirtualMachineInstance, pod *k8sv1
 		reason = syncErr.Reason()
 	}
 	conditionManager.CheckFailure(vmiCopy, syncErr, reason)
-	controller.SetVMIPhaseTransitionTimestamp(vmi, vmiCopy)
+	controller.SetVMIPhaseTransitionTimestamp(&vmi.Status, &vmiCopy.Status)
 
 	// If we detect a change on the vmi we update the vmi
 	vmiChanged := !equality.Semantic.DeepEqual(vmi.Status, vmiCopy.Status) || !equality.Semantic.DeepEqual(vmi.Finalizers, vmiCopy.Finalizers) || !equality.Semantic.DeepEqual(vmi.Annotations, vmiCopy.Annotations) || !equality.Semantic.DeepEqual(vmi.Labels, vmiCopy.Labels)
@@ -861,6 +864,9 @@ func (c *Controller) deletePod(vmiKey string, pod *k8sv1.Pod, options v1.DeleteO
 	err := c.clientset.CoreV1().Pods(pod.Namespace).Delete(context.Background(), pod.Name, options)
 	if err != nil {
 		c.podExpectations.DeletionObserved(vmiKey, controller.PodKey(pod))
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
 	}
 	return err
 }
@@ -963,6 +969,59 @@ func (c *Controller) syncMemoryHotplug(vmi *virtv1.VirtualMachineInstance) {
 			vmi.Labels = map[string]string{}
 		}
 		vmi.Labels[virtv1.MemoryHotplugOverheadRatioLabel] = *overheadRatio
+	}
+}
+
+func (c *Controller) syncMigrationRequiredCondition(vmi *virtv1.VirtualMachineInstance) {
+	const pendingMigrationReEvalPeriod = 10 * time.Second
+
+	if migrations.IsMigrating(vmi) {
+		return
+	}
+
+	result := c.netMigrationEvaluator.Evaluate(vmi)
+
+	cm := controller.NewVirtualMachineInstanceConditionManager()
+	existingCondition := cm.GetCondition(vmi, virtv1.VirtualMachineInstanceMigrationRequired)
+
+	switch {
+	case result == k8sv1.ConditionUnknown && existingCondition == nil:
+		return
+	case result == k8sv1.ConditionUnknown && existingCondition != nil:
+		cm.RemoveCondition(vmi, virtv1.VirtualMachineInstanceMigrationRequired)
+		return
+	}
+
+	if existingCondition != nil && existingCondition.Status == k8sv1.ConditionTrue {
+		return
+	}
+
+	cm.UpdateCondition(vmi, newMigrationRequiredCondition(result))
+
+	if result == k8sv1.ConditionTrue {
+		return
+	}
+
+	// Re-enqueue the VMI object in order to make sure the VMI will be handled again after at most pendingMigrationReEvalPeriod.
+	// This is done in order to handle a scenario where the status was set to `False`, and none of the objects
+	// the VMI controller watches had changed.
+	key, _ := controller.KeyFunc(vmi)
+	c.Queue.AddAfter(key, pendingMigrationReEvalPeriod)
+}
+
+func newMigrationRequiredCondition(status k8sv1.ConditionStatus) *virtv1.VirtualMachineInstanceCondition {
+	reason := virtv1.VirtualMachineInstanceReasonAutoMigrationDueToLiveUpdate
+	if status == k8sv1.ConditionFalse {
+		reason = virtv1.VirtualMachineInstanceReasonAutoMigrationPending
+	}
+
+	return &virtv1.VirtualMachineInstanceCondition{
+		Type:               virtv1.VirtualMachineInstanceMigrationRequired,
+		Status:             status,
+		LastProbeTime:      v1.Time{},
+		LastTransitionTime: v1.Now(),
+		Reason:             reason,
+		Message:            "",
 	}
 }
 

@@ -45,6 +45,7 @@ import (
 	"libvirt.org/go/libvirt"
 
 	k8sv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -186,6 +187,7 @@ type LibvirtDomainManager struct {
 
 	cpuSetGetter                  func() ([]int, error)
 	imageVolumeFeatureGateEnabled bool
+	setTimeOnce                   sync.Once
 }
 
 type pausedVMIs struct {
@@ -238,6 +240,7 @@ func newLibvirtDomainManager(connection cli.Connection, virtShareDir, ephemeralD
 		migrateInfoStats:              &stats.DomainJobInfo{},
 		metadataCache:                 metadataCache,
 		cpuSetGetter:                  cpuSetGetter,
+		setTimeOnce:                   sync.Once{},
 		imageVolumeFeatureGateEnabled: imageVolumeEnabled,
 	}
 
@@ -360,7 +363,7 @@ func (l *LibvirtDomainManager) UpdateGuestMemory(vmi *v1.VirtualMachineInstance)
 	return nil
 }
 
-func (l *LibvirtDomainManager) setGuestTime(vmi *v1.VirtualMachineInstance) error {
+func (l *LibvirtDomainManager) setGuestTime(vmi *v1.VirtualMachineInstance) {
 	// Try to set VM time to the current value.  This is typically useful
 	// when clock wasn't running on the VM for some time (e.g. during
 	// suspension or migration), especially if the time delay exceeds NTP
@@ -369,75 +372,73 @@ func (l *LibvirtDomainManager) setGuestTime(vmi *v1.VirtualMachineInstance) erro
 	// environment, especially QEMU agent presence) or that the set time is
 	// very precise (NTP in the guest should take care of it if needed).
 
-	domName := api.VMINamespaceKeyFunc(vmi)
-	dom, err := l.virConn.LookupDomainByName(domName)
-	if err != nil {
-		log.Log.Object(vmi).Reason(err).Error(failedSyncGuestTime)
-		return err
-	}
-
-	go func() {
-		defer dom.Free()
-
-		// Syncing the guest time is a best-effort. Therefore
-		// don't flood the logs
-		var latestErr error
-		defer func() {
-			if latestErr != nil {
-				log.Log.Object(vmi).Warning(latestErr.Error())
+	l.setTimeOnce.Do(func() {
+		go func() {
+			domName := api.VMINamespaceKeyFunc(vmi)
+			dom, err := l.virConn.LookupDomainByName(domName)
+			if err != nil {
+				log.Log.Object(vmi).Reason(err).Error(failedSyncGuestTime)
+				return
 			}
-		}()
+			defer dom.Free()
+			// Syncing the guest time is a best-effort. Therefore
+			// don't flood the logs
+			var latestErr error
+			defer func() {
+				if latestErr != nil {
+					log.Log.Object(vmi).Warning(latestErr.Error())
+				}
+			}()
 
-		ctx := l.getGuestTimeContext()
-		timeout := time.After(60 * time.Second)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-timeout:
-				log.Log.Object(vmi).Error(failedSyncGuestTime)
-				return
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				currTime := time.Now()
-				secs := currTime.Unix()
-				nsecs := uint(currTime.Nanosecond())
-				err := dom.SetTime(secs, nsecs, 0)
-				if err != nil {
-					libvirtError, ok := err.(libvirt.Error)
-					if !ok {
-						log.Log.Object(vmi).Reason(err).Warning(failedSyncGuestTime)
-						return
-					}
-
-					switch libvirtError.Code {
-					case libvirt.ERR_AGENT_UNRESPONSIVE:
-						const unresponsive = "failed to set time: QEMU agent unresponsive"
-						latestErr = fmt.Errorf("%s, %s", unresponsive, err)
-						log.Log.Object(vmi).Reason(err).V(9).Info(unresponsive)
-					case libvirt.ERR_OPERATION_UNSUPPORTED:
-						// no need to retry as this opertaion is not supported
-						log.Log.Object(vmi).Reason(err).Warning("failed to set time: not supported")
-						return
-					case libvirt.ERR_ARGUMENT_UNSUPPORTED:
-						// no need to retry as the agent is not configured
-						log.Log.Object(vmi).Reason(err).Warning("failed to set time: agent not configured")
-						return
-					default:
-						latestErr = fmt.Errorf("%s, %s", failedSyncGuestTime, err)
-						log.Log.Object(vmi).Reason(err).V(9).Info(failedSyncGuestTime)
-					}
-				} else {
-					latestErr = nil
-					log.Log.Object(vmi).Info("guest VM time sync finished successfully")
+			ctx := l.getGuestTimeContext()
+			timeout := time.After(60 * time.Second)
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-timeout:
+					log.Log.Object(vmi).Error(failedSyncGuestTime)
 					return
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					currTime := time.Now()
+					secs := currTime.Unix()
+					nsecs := uint(currTime.Nanosecond())
+					err := dom.SetTime(secs, nsecs, 0)
+					if err != nil {
+						libvirtError, ok := err.(libvirt.Error)
+						if !ok {
+							log.Log.Object(vmi).Reason(err).Warning(failedSyncGuestTime)
+							return
+						}
+
+						switch libvirtError.Code {
+						case libvirt.ERR_AGENT_UNRESPONSIVE:
+							const unresponsive = "failed to set time: QEMU agent unresponsive"
+							latestErr = fmt.Errorf("%s, %s", unresponsive, err)
+							log.Log.Object(vmi).Reason(err).V(9).Info(unresponsive)
+						case libvirt.ERR_OPERATION_UNSUPPORTED:
+							// no need to retry as this opertaion is not supported
+							log.Log.Object(vmi).Reason(err).Warning("failed to set time: not supported")
+							return
+						case libvirt.ERR_ARGUMENT_UNSUPPORTED:
+							// no need to retry as the agent is not configured
+							log.Log.Object(vmi).Reason(err).Warning("failed to set time: agent not configured")
+							return
+						default:
+							latestErr = fmt.Errorf("%s, %s", failedSyncGuestTime, err)
+							log.Log.Object(vmi).Reason(err).V(9).Info(failedSyncGuestTime)
+						}
+					} else {
+						latestErr = nil
+						log.Log.Object(vmi).Info("guest VM time sync finished successfully")
+						return
+					}
 				}
 			}
-		}
-	}()
-
-	return nil
+		}()
+	})
 }
 
 func (l *LibvirtDomainManager) getGuestTimeContext() context.Context {
@@ -1050,7 +1051,7 @@ func (l *LibvirtDomainManager) generateConverterContext(vmi *v1.VirtualMachineIn
 		UseVirtioTransitional: vmi.Spec.Domain.Devices.UseVirtioTransitional != nil && *vmi.Spec.Domain.Devices.UseVirtioTransitional,
 		PermanentVolumes:      permanentVolumes,
 		EphemeraldiskCreator:  l.ephemeralDiskCreator,
-		UseLaunchSecurity:     kutil.IsSEVVMI(vmi),
+		UseLaunchSecurity:     kutil.UseLaunchSecurity(vmi),
 		FreePageReporting:     isFreePageReportingEnabled(false, vmi),
 		SerialConsoleLog:      isSerialConsoleLogEnabled(false, vmi),
 	}
@@ -1182,7 +1183,7 @@ func (l *LibvirtDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmul
 		return nil, err
 	}
 
-	if err := l.syncDiskHotplug(domain, oldSpec, dom, vmi); err != nil {
+	if err := l.syncDisks(domain, oldSpec, dom, vmi); err != nil {
 		return nil, err
 	}
 
@@ -1194,7 +1195,7 @@ func (l *LibvirtDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmul
 	return oldSpec, nil
 }
 
-func (l *LibvirtDomainManager) syncDiskHotplug(
+func (l *LibvirtDomainManager) syncDisks(
 	domain *api.Domain,
 	spec *api.DomainSpec,
 	dom cli.VirDomain,
@@ -1244,6 +1245,33 @@ func (l *LibvirtDomainManager) syncDiskHotplug(
 		err = dom.AttachDeviceFlags(strings.ToLower(string(attachBytes)), affectDeviceLiveAndConfigLibvirtFlags)
 		if err != nil {
 			logger.Reason(err).Error("attaching device")
+			return err
+		}
+	}
+	// Look up all the disks to UPDATE
+	for _, updateDisk := range getUpdatedDisks(spec.Devices.Disks, domain.Spec.Devices.Disks) {
+		sourceFile := getSourceFile(updateDisk)
+		if sourceFile != "" {
+			allowUpdate, err := checkIfDiskReadyToUse(getSourceFile(updateDisk))
+			if err != nil {
+				return err
+			}
+			if !allowUpdate {
+				continue
+			}
+		}
+
+		logger.V(1).Infof("Updating disk %s, target %s", updateDisk.Alias.GetName(), updateDisk.Target.Device)
+
+		updateBytes, err := xml.Marshal(updateDisk)
+		if err != nil {
+			logger.Reason(err).Error("marshalling updated disk failed")
+			return err
+		}
+
+		err = dom.UpdateDeviceFlags(strings.ToLower(string(updateBytes)), affectDeviceLiveAndConfigLibvirtFlags)
+		if err != nil {
+			logger.Reason(err).Error("updating device")
 			return err
 		}
 	}
@@ -1406,17 +1434,14 @@ func isHotplugDisk(disk api.Disk) bool {
 func getDetachedDisks(oldDisks, newDisks []api.Disk) []api.Disk {
 	newDiskMap := make(map[string]api.Disk)
 	for _, disk := range newDisks {
-		file := getSourceFile(disk)
-		if file != "" {
-			newDiskMap[file] = disk
-		}
+		newDiskMap[disk.Target.Device] = disk
 	}
 	res := make([]api.Disk, 0)
 	for _, oldDisk := range oldDisks {
 		if !isHotplugDisk(oldDisk) {
 			continue
 		}
-		if _, ok := newDiskMap[getSourceFile(oldDisk)]; !ok {
+		if _, ok := newDiskMap[oldDisk.Target.Device]; !ok {
 			// This disk got detached, add it to the list
 			res = append(res, oldDisk)
 		}
@@ -1427,20 +1452,62 @@ func getDetachedDisks(oldDisks, newDisks []api.Disk) []api.Disk {
 func getAttachedDisks(oldDisks, newDisks []api.Disk) []api.Disk {
 	oldDiskMap := make(map[string]api.Disk)
 	for _, disk := range oldDisks {
-		file := getSourceFile(disk)
-		if file != "" {
-			oldDiskMap[file] = disk
-		}
+		oldDiskMap[disk.Target.Device] = disk
 	}
 	res := make([]api.Disk, 0)
 	for _, newDisk := range newDisks {
 		if !isHotplugDisk(newDisk) {
 			continue
 		}
-		if _, ok := oldDiskMap[getSourceFile(newDisk)]; !ok {
+		if _, ok := oldDiskMap[newDisk.Target.Device]; !ok {
 			// This disk got attached, add it to the list
 			res = append(res, newDisk)
 		}
+	}
+	return res
+}
+
+func isHotPlugDiskOrEmpty(disk api.Disk) bool {
+	return isHotplugDisk(disk) || getSourceFile(disk) == ""
+}
+
+func getUpdatedDisks(oldDisks, newDisks []api.Disk) []api.Disk {
+	oldDiskMap := make(map[string]api.Disk)
+	for _, disk := range oldDisks {
+		oldDiskMap[disk.Target.Device] = disk
+	}
+	var res []api.Disk
+	for _, newDisk := range newDisks {
+		oldDisk, ok := oldDiskMap[newDisk.Target.Device]
+		if !ok {
+			continue
+		}
+		// only support cd-rom for now
+		if oldDisk.Device != "cdrom" || newDisk.Device != "cdrom" {
+			continue
+		}
+		if !isHotPlugDiskOrEmpty(newDisk) || !isHotPlugDiskOrEmpty(oldDisk) {
+			continue
+		}
+		if equality.Semantic.DeepEqual(oldDisk.Source, newDisk.Source) {
+			continue
+		}
+		newDiskCpy := oldDisk.DeepCopy()
+		if getSourceFile(newDisk) == "" {
+			newDiskCpy.Source = api.DiskSource{}
+		} else {
+			newDiskCpy.Source = *newDisk.Source.DeepCopy()
+		}
+
+		newDiskCpy.Type = "block"
+		if newDiskCpy.Source.File != "" {
+			newDiskCpy.Type = "file"
+		}
+		if newDiskCpy.Driver == nil {
+			newDiskCpy.Driver = &api.DiskDriver{}
+		}
+		newDiskCpy.Driver.Type = "raw"
+		res = append(res, *newDiskCpy)
 	}
 	return res
 }
@@ -1699,10 +1766,7 @@ func (l *LibvirtDomainManager) UnpauseVMI(vmi *v1.VirtualMachineInstance) error 
 		l.paused.remove(vmi.UID)
 		// Try to set guest time after this commands execution.
 		// This operation is not disruptive.
-		if err := l.setGuestTime(vmi); err != nil {
-			return err
-		}
-
+		l.setGuestTime(vmi)
 	} else {
 		logger.Infof("Domain is not paused for %s", vmi.GetObjectMeta().GetName())
 	}
