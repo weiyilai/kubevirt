@@ -48,6 +48,7 @@ import (
 	"kubevirt.io/kubevirt/pkg/testutils"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 	"kubevirt.io/kubevirt/pkg/virt-controller/watch/common"
+	"kubevirt.io/kubevirt/pkg/virt-controller/watch/descheduler"
 	watchtesting "kubevirt.io/kubevirt/pkg/virt-controller/watch/testing"
 	watchutil "kubevirt.io/kubevirt/pkg/virt-controller/watch/util"
 	"kubevirt.io/kubevirt/tests/framework/matcher"
@@ -3203,6 +3204,73 @@ var _ = Describe("VirtualMachine", func() {
 			Expect(vmi.Annotations).To(Equal(annotations))
 		})
 
+		Context("dynamic annotations", func() {
+			const selectedKey = descheduler.EvictPodAnnotationKeyBeta
+			const ignoredKey = "anotherAnnotation"
+			const intitialValue = "initialValue"
+			const updatedValue = "updatedValue"
+			const anotherValue = "anotherValue"
+
+			DescribeTable("should sync selected dynamic annotations from spec.template to vmi", func(existingAnnotations, updatedVMAnnotations, expectedVMIAnnotations map[string]string, numExpectedPatches int) {
+				vm, vmi := watchtesting.DefaultVirtualMachine(true)
+				vm.Spec.Template.ObjectMeta.Annotations = existingAnnotations
+				vmi.ObjectMeta.Annotations = existingAnnotations
+
+				vm, err := virtFakeClient.KubevirtV1().VirtualMachines(vm.Namespace).Create(context.TODO(), vm, metav1.CreateOptions{})
+				Expect(err).To(Succeed())
+
+				vm.Spec.Template.ObjectMeta.Annotations = updatedVMAnnotations
+				vm, err = virtFakeClient.KubevirtV1().VirtualMachines(vm.Namespace).Update(context.Background(), vm, metav1.UpdateOptions{})
+				Expect(err).ToNot(HaveOccurred())
+				addVirtualMachine(vm)
+				vmi, err = virtFakeClient.KubevirtV1().VirtualMachineInstances(vm.Namespace).Create(context.Background(), vmi, metav1.CreateOptions{})
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(controller.vmiIndexer.Add(vmi)).To(Succeed())
+
+				sanityExecute(vm)
+
+				By("Expecting to see the updated VMI with the updated annotations")
+				vmi, err = virtFakeClient.KubevirtV1().VirtualMachineInstances(vm.Namespace).Get(context.TODO(), vm.Name, metav1.GetOptions{})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(vmi.ObjectMeta.Annotations).To(Equal(expectedVMIAnnotations))
+
+				Expect(kvtesting.FilterActions(&virtFakeClient.Fake, "patch", "virtualmachineinstances")).To(HaveLen(numExpectedPatches))
+
+			},
+				Entry("should copy selected annotations from VM.spec.template.metadata.annotations to VMI",
+					map[string]string{selectedKey: intitialValue},
+					map[string]string{selectedKey: updatedValue},
+					map[string]string{selectedKey: updatedValue},
+					1,
+				),
+				Entry("should remove selected annotations from VMI if missing in VM.spec.template.metadata.annotations",
+					map[string]string{selectedKey: intitialValue, ignoredKey: anotherValue},
+					map[string]string{ignoredKey: anotherValue},
+					map[string]string{ignoredKey: anotherValue},
+					1,
+				),
+				Entry("should do nothing if selected annotations are already equal",
+					map[string]string{selectedKey: intitialValue, ignoredKey: anotherValue},
+					map[string]string{selectedKey: intitialValue, ignoredKey: anotherValue},
+					map[string]string{selectedKey: intitialValue, ignoredKey: anotherValue},
+					0,
+				),
+				Entry("should update only selected annotations",
+					map[string]string{selectedKey: intitialValue, ignoredKey: anotherValue},
+					map[string]string{selectedKey: updatedValue, ignoredKey: updatedValue},
+					map[string]string{selectedKey: updatedValue, ignoredKey: anotherValue},
+					1,
+				),
+				Entry("should ignore other annotations on VM.spec.template.metadata.annotations",
+					map[string]string{selectedKey: intitialValue},
+					map[string]string{selectedKey: intitialValue, ignoredKey: updatedValue},
+					map[string]string{selectedKey: intitialValue},
+					0,
+				),
+			)
+		})
+
 		Context("VM memory dump", func() {
 			const testPVCName = "testPVC"
 
@@ -5932,6 +6000,13 @@ var _ = Describe("VirtualMachine", func() {
 			})
 		})
 
+		clearExpectations := func(vm *v1.VirtualMachine) {
+			//Clear all expectations
+			key, err := virtcontroller.KeyFunc(vm)
+			Expect(err).To(Not(HaveOccurred()))
+			controller.expectations.SetExpectations(key, 0, 0)
+		}
+
 		Context("RunStrategy", func() {
 
 			It("when starting a VM with RerunOnFailure the VM should get started", func() {
@@ -6088,13 +6163,6 @@ var _ = Describe("VirtualMachine", func() {
 				Expect(vmi).ToNot(BeNil())
 			})
 
-			clearExpectations := func(vm *v1.VirtualMachine) {
-				//Clear all expectations
-				key, err := virtcontroller.KeyFunc(vm)
-				Expect(err).To(Not(HaveOccurred()))
-				controller.expectations.SetExpectations(key, 0, 0)
-			}
-
 			It("when issuing a restart a VM with Always should get restarted", func() {
 				vm, _ := watchtesting.DefaultVirtualMachine(true)
 				vm.Spec.Running = nil
@@ -6193,6 +6261,47 @@ var _ = Describe("VirtualMachine", func() {
 			})
 		})
 
+		Context("decentralized migration", func() {
+			It("should stop the VM if the VMI is reporting that the migration is succeeded and the migration reports it is succeeded", func() {
+				vm, _ := watchtesting.DefaultVirtualMachine(true)
+				key, err := virtcontroller.KeyFunc(vm)
+				Expect(err).ToNot(HaveOccurred())
+
+				vm, err = virtFakeClient.KubevirtV1().VirtualMachines(vm.Namespace).Create(context.TODO(), vm, metav1.CreateOptions{})
+				Expect(err).ToNot(HaveOccurred())
+
+				addVirtualMachine(vm)
+				sanityExecute(vm)
+				clearExpectations(vm)
+
+				vmi, err := virtFakeClient.KubevirtV1().VirtualMachineInstances(vm.Namespace).Get(context.TODO(), vm.Name, metav1.GetOptions{})
+				Expect(err).ToNot(HaveOccurred())
+				By("marking the VMI as migration completed and decentralized")
+				vmi.Status.MigrationState = &v1.VirtualMachineInstanceMigrationState{
+					MigrationUID: "123",
+					Completed:    true,
+					TargetState:  &v1.VirtualMachineInstanceMigrationTargetState{},
+					SourceState: &v1.VirtualMachineInstanceMigrationSourceState{
+						VirtualMachineInstanceCommonMigrationState: v1.VirtualMachineInstanceCommonMigrationState{
+							MigrationUID: "123",
+							SyncAddress:  pointer.P("127.0.0.1:5900"),
+						},
+					},
+				}
+				vmi.Status.Phase = v1.Succeeded
+				vmi, err = virtFakeClient.KubevirtV1().VirtualMachineInstances(vm.Namespace).Update(context.TODO(), vmi, metav1.UpdateOptions{})
+				Expect(err).ToNot(HaveOccurred())
+
+				// let the controller pick up the creation
+				controller.vmiIndexer.Add(vmi)
+
+				controller.Queue.Add(key)
+				sanityExecute(vm)
+				vm, err = virtFakeClient.KubevirtV1().VirtualMachines(vm.Namespace).Get(context.TODO(), vm.Name, metav1.GetOptions{})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(vm.Spec.RunStrategy).To(Equal(pointer.P(v1.RunStrategyHalted)))
+			})
+		})
 	})
 	Context("syncConditions", func() {
 		var vm *v1.VirtualMachine
@@ -6268,6 +6377,14 @@ var _ = Describe("VirtualMachine", func() {
 				Name: name,
 			}
 		}
+		createCDRom := func(name string) v1.Disk {
+			return v1.Disk{
+				Name: name,
+				DiskDevice: v1.DiskDevice{
+					CDRom: &v1.CDRomTarget{},
+				},
+			}
+		}
 		DescribeTable("should be validated for volume updates", func(oldVols, newVols []v1.Volume, expectValid bool) {
 			oldVm, _ := watchtesting.DefaultVirtualMachine(true)
 			newVm := oldVm.DeepCopy()
@@ -6317,6 +6434,10 @@ var _ = Describe("VirtualMachine", func() {
 				createPVCVol("vol2", "test2", false)}, []v1.Disk{createDisk("vol2")}, []v1.Disk{createDisk("vol1"), createDisk("vol2")}, true),
 			Entry("for a removed hotpluggable pvc", []v1.Volume{createPVCVol("vol1", "test1", true)}, []v1.Volume{},
 				[]v1.Disk{createDisk("vol1")}, []v1.Disk{}, true),
+			Entry("cd-rom eject", []v1.Volume{createPVCVol("vol1", "test1", false), createPVCVol("vol2", "test2", true)}, []v1.Volume{createPVCVol("vol1", "test1", false)},
+				[]v1.Disk{createDisk("vol1"), createCDRom("vol2")}, []v1.Disk{createDisk("vol1"), createCDRom("vol2")}, true),
+			Entry("cd-rom inject", []v1.Volume{createPVCVol("vol1", "test1", false)}, []v1.Volume{createPVCVol("vol1", "test1", false), createPVCVol("vol2", "test2", true)},
+				[]v1.Disk{createDisk("vol1"), createCDRom("vol2")}, []v1.Disk{createDisk("vol1"), createCDRom("vol2")}, true),
 		)
 	})
 

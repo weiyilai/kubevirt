@@ -513,6 +513,8 @@ spec:
             tag: tagValue
           logSerialConsole: true
           networkInterfaceMultiqueue: true
+          panicDevices:
+          - model: modelValue
           rng: {}
           sound:
             model: modelValue
@@ -521,6 +523,8 @@ spec:
             enabled: true
             persistent: true
           useVirtioTransitional: true
+          video:
+            type: typeValue
           watchdog:
             diag288:
               action: actionValue
@@ -576,6 +580,7 @@ spec:
             enabled: true
         firmware:
           acpi:
+            msdmNameRef: msdmNameRefValue
             slicNameRef: slicNameRefValue
           bootloader:
             bios:

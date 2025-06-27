@@ -42,6 +42,7 @@ const DefaultGracePeriodSeconds int64 = 30
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +genclient
+// +genclient:noStatus
 type VirtualMachineInstance struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -114,7 +115,7 @@ type VirtualMachineInstanceSpec struct {
 	// - "None": No action will be taken, according to the specified 'RunStrategy' the VirtualMachine will be restarted or shutdown.
 	// - "LiveMigrate": the VirtualMachineInstance will be migrated instead of being shutdown.
 	// - "LiveMigrateIfPossible": the same as "LiveMigrate" but only if the VirtualMachine is Live-Migratable, otherwise it will behave as "None".
-	// - "External": the VirtualMachineInstance will be protected by a PDB and `vmi.Status.EvacuationNodeName` will be set on eviction. This is mainly useful for cluster-api-provider-kubevirt (capk) which needs a way for VMI's to be blocked from eviction, yet signal capk that eviction has been called on the VMI so the capk controller can handle tearing the VMI down. Details can be found in the commit description https://github.com/kubevirt/kubevirt/commit/c1d77face705c8b126696bac9a3ee3825f27f1fa.
+	// - "External": the VirtualMachineInstance will be protected and `vmi.Status.EvacuationNodeName` will be set on eviction. This is mainly useful for cluster-api-provider-kubevirt (capk) which needs a way for VMI's to be blocked from eviction, yet signal capk that eviction has been called on the VMI so the capk controller can handle tearing the VMI down. Details can be found in the commit description https://github.com/kubevirt/kubevirt/commit/c1d77face705c8b126696bac9a3ee3825f27f1fa.
 	// +optional
 	EvictionStrategy *EvictionStrategy `json:"evictionStrategy,omitempty"`
 	// StartStrategy can be set to "Paused" if Virtual Machine should be started in paused state.
@@ -536,6 +537,11 @@ func (v *VirtualMachineInstance) IsHighPerformanceVMI() bool {
 	return false
 }
 
+func (v *VirtualMachineInstance) IsMigrationSource() bool {
+	// Can use this after being fully synchronized.
+	return v.Status.MigrationState != nil && v.Status.MigrationState.TargetState != nil && v.Status.MigrationState.TargetState.SyncAddress != nil && v.Status.MigrationState.TargetState.NodeAddress != nil
+}
+
 func (v *VirtualMachineInstance) IsMigrationTarget() bool {
 	return v.GetAnnotations()[CreateMigrationTarget] == "true"
 }
@@ -550,8 +556,27 @@ func (v *VirtualMachineInstance) IsMigrationTargetNodeLabelSet() bool {
 	return ok
 }
 
-func (v *VirtualMachineInstance) IsMigrationSynchronized(decentralized bool) bool {
-	if decentralized {
+// Assume that this only called when in decentralized live migration
+func (v *VirtualMachineInstance) IsMigrationSourceSynchronized() bool {
+	return v.Status.MigrationState != nil && v.Status.MigrationState.SourceState != nil &&
+		v.Status.MigrationState.TargetState != nil &&
+		v.Status.MigrationState.SourceState.MigrationUID != "" &&
+		v.Status.MigrationState.SourceState.Pod != "" &&
+		v.Status.MigrationState.SourceState.NodeSelectors != nil &&
+		v.Status.MigrationState.SourceState.Node != ""
+}
+
+func (v *VirtualMachineInstance) IsMigrationCompleted() bool {
+	return v.Status.MigrationState != nil && v.Status.MigrationState.Completed
+}
+
+// IsMigrationSynchronized is true after a decentralized migration VMI has sync with the other side. It
+// checks if the SourceState and TargetState are not nil, and the migrationUIDs are set. This can only
+// happen when both sides have synchronized at least once. For 'local' migrations this returns true if the
+// migration state is not nil. Essentially this happens after the migration resource is created.
+func (v *VirtualMachineInstance) IsMigrationSynchronized(migration *VirtualMachineInstanceMigration) bool {
+
+	if migration.IsDecentralized() {
 		return v.Status.MigrationState != nil && v.Status.MigrationState.SourceState != nil &&
 			v.Status.MigrationState.TargetState != nil &&
 			v.Status.MigrationState.SourceState.MigrationUID != "" &&
@@ -559,6 +584,25 @@ func (v *VirtualMachineInstance) IsMigrationSynchronized(decentralized bool) boo
 	} else {
 		return v.Status.MigrationState != nil
 	}
+}
+
+func (v *VirtualMachineInstance) IsTargetPreparing(migration *VirtualMachineInstanceMigration) bool {
+	if migration.IsDecentralized() {
+		return v.IsMigrationSynchronized(migration) &&
+			v.Status.MigrationState.TargetState.Pod != "" &&
+			v.Status.MigrationState.TargetState.Node != ""
+	} else {
+		return v.Status.MigrationState != nil && v.Status.MigrationState.MigrationUID == migration.UID &&
+			v.Status.MigrationState.TargetNode != ""
+	}
+}
+
+func (v *VirtualMachineInstance) IsDecentralizedMigration() bool {
+	return v.Status.MigrationState != nil &&
+		v.Status.MigrationState.TargetState != nil &&
+		v.Status.MigrationState.SourceState != nil &&
+		((v.Status.MigrationState.SourceState.SyncAddress == nil && v.Status.MigrationState.TargetState.SyncAddress != nil) ||
+			(v.Status.MigrationState.SourceState.SyncAddress != nil && v.Status.MigrationState.TargetState.SyncAddress == nil))
 }
 
 type VirtualMachineInstanceConditionType string
@@ -606,6 +650,9 @@ const (
 
 	// Indicates whether the VMI is live migratable
 	VirtualMachineInstanceIsStorageLiveMigratable VirtualMachineInstanceConditionType = "StorageLiveMigratable"
+
+	// VirtualMachineInstanceMigrationRequired Indicates that an automatic migration is required
+	VirtualMachineInstanceMigrationRequired VirtualMachineInstanceConditionType = "MigrationRequired"
 )
 
 // These are valid reasons for VMI conditions.
@@ -624,6 +671,8 @@ const (
 	VirtualMachineInstanceReasonHostDeviceNotMigratable = "HostDeviceNotLiveMigratable"
 	// Reason means that VMI is not live migratable because it uses Secure Encrypted Virtualization (SEV)
 	VirtualMachineInstanceReasonSEVNotMigratable = "SEVNotLiveMigratable"
+	// Reason means that VMI is not live migratable because it uses IBM Secure Execution
+	VirtualMachineInstanceReasonSecureExecutionNotMigratable = "SecureExecutionNotLiveMigratable"
 	// Reason means that VMI is not live migratable because it uses HyperV Reenlightenment while TSC Frequency is not available
 	VirtualMachineInstanceReasonNoTSCFrequencyMigratable = "NoTSCFrequencyNotLiveMigratable"
 	// Reason means that VMI is not live migratable because it uses HyperV Reenlightenment while TSC Frequency is not available
@@ -638,6 +687,12 @@ const (
 	VirtualMachineInstanceReasonNotMigratable = "NotMigratable"
 	// Reason means that the volume update change was cancelled
 	VirtualMachineInstanceReasonVolumesChangeCancellation = "VolumesChangeCancellation"
+
+	// Indicates that automatic migration is required due to a change made to a running VM
+	VirtualMachineInstanceReasonAutoMigrationDueToLiveUpdate = "AutoMigrationDueToLiveUpdate"
+
+	// Indicates that automatic migration is pending
+	VirtualMachineInstanceReasonAutoMigrationPending = "AutoMigrationPending"
 )
 
 const (
@@ -701,7 +756,9 @@ func (m *VirtualMachineInstanceMigration) IsRunning() bool {
 // The migration phase indicates that the target pod should have already been created
 func (m *VirtualMachineInstanceMigration) TargetIsCreated() bool {
 	return m.Status.Phase != MigrationPhaseUnset &&
-		m.Status.Phase != MigrationPending
+		m.Status.Phase != MigrationPending &&
+		m.Status.Phase != MigrationWaitingForSync &&
+		m.Status.Phase != MigrationSynchronizing
 }
 
 // The migration phase indicates that job has been handed off to the VMI controllers to complete.
@@ -709,7 +766,9 @@ func (m *VirtualMachineInstanceMigration) TargetIsHandedOff() bool {
 	return m.Status.Phase != MigrationPhaseUnset &&
 		m.Status.Phase != MigrationPending &&
 		m.Status.Phase != MigrationScheduling &&
-		m.Status.Phase != MigrationScheduled
+		m.Status.Phase != MigrationScheduled &&
+		m.Status.Phase != MigrationWaitingForSync &&
+		m.Status.Phase != MigrationSynchronizing
 }
 
 type VirtualMachineInstanceNetworkInterface struct {
@@ -779,6 +838,10 @@ type VirtualMachineInstanceCommonMigrationState struct {
 	SyncAddress *string `json:"syncAddress,omitempty"`
 	// If the VMI being migrated uses persistent features (backend-storage), its source PVC name is saved here
 	PersistentStatePVCName *string `json:"persistentStatePVCName,omitempty"`
+	// SELinuxContext is the actual SELinux context of the pod
+	SelinuxContext string `json:"selinuxContext,omitempty"`
+	// VirtualMachineInstanceUID is the UID of the target virtual machine instance
+	VirtualMachineInstanceUID *types.UID `json:"virtualMachineInstanceUID,omitempty"`
 }
 
 // +k8s:openapi-gen=true
@@ -942,6 +1005,8 @@ const (
 	Succeeded VirtualMachineInstancePhase = "Succeeded"
 	// Failed means that the vmi crashed, disappeared unexpectedly or got deleted from the cluster before it was ever started.
 	Failed VirtualMachineInstancePhase = "Failed"
+	// WaitingForSync means that the vmi is waiting for synchronization from another VMI
+	WaitingForSync VirtualMachineInstancePhase = "WaitingForSync"
 	// Unknown means that for some reason the state of the VirtualMachineInstance could not be obtained, typically due
 	// to an error in communicating with the host of the VirtualMachineInstance.
 	Unknown VirtualMachineInstancePhase = "Unknown"
@@ -1096,13 +1161,14 @@ const (
 	MemfdMemoryBackend         string = "kubevirt.io/memfd"
 
 	MigrationSelectorLabel = "kubevirt.io/vmi-name"
+	// RestoreRunStrategy is how to restore the run strategy of the VMI
+	RestoreRunStrategy = "kubevirt.io/restore-run-strategy"
 
 	// This annotation represents vmi running nonroot implementation
 	DeprecatedNonRootVMIAnnotation = "kubevirt.io/nonroot"
 
 	// This annotation is used to mark a VMI as a migration target, and to start a receiver pod.
 	CreateMigrationTarget = "kubevirt.io/create-migration-target"
-
 	// This annotation is to keep virt launcher container alive when an VMI encounters a failure for debugging purpose
 	KeepLauncherAfterFailureAnnotation string = "kubevirt.io/keep-launcher-alive-after-failure"
 
@@ -1134,6 +1200,9 @@ const (
 
 	// SEVESLabel marks the node as capable of running workloads with SEV-ES
 	SEVESLabel string = "kubevirt.io/sev-es"
+
+	// SecureExecutionLabel marks the node as capable of running workloads with IBM Secure Execution
+	SecureExecutionLabel string = "kubevirt.io/s390-pv"
 
 	// KSMEnabledLabel marks the node as KSM-handling enabled
 	KSMEnabledLabel string = "kubevirt.io/ksm-enabled"
@@ -1553,20 +1622,26 @@ const (
 	MigrationSucceeded VirtualMachineInstanceMigrationPhase = "Succeeded"
 	// The migration failed
 	MigrationFailed VirtualMachineInstanceMigrationPhase = "Failed"
-	// WaitingForSync means that the vmi is waiting for synchronization from another VMI
-	WaitingForSync VirtualMachineInstancePhase = "WaitingForSync"
+	// The migration is waiting for the VMI to synchronize
+	MigrationWaitingForSync VirtualMachineInstanceMigrationPhase = "WaitingForSync"
+	// The migration is actively synchronizing the VMI with the target
+	MigrationSynchronizing VirtualMachineInstanceMigrationPhase = "Synchronizing"
 )
 
-func (m *VirtualMachineInstanceMigration) IsSource() bool {
-	return (m.Spec.SendTo == nil && m.Spec.Receive == nil) ||
-		(m.Spec.SendTo != nil && m.Spec.Receive != nil) ||
-		(m.Spec.SendTo != nil && m.Spec.Receive == nil)
+func (m *VirtualMachineInstanceMigration) IsLocalOrDecentralizedSource() bool {
+	return !m.IsDecentralized() || m.Spec.SendTo != nil
 }
 
-func (m *VirtualMachineInstanceMigration) IsTarget() bool {
-	return (m.Spec.SendTo == nil && m.Spec.Receive == nil) ||
-		(m.Spec.SendTo != nil && m.Spec.Receive != nil) ||
-		(m.Spec.SendTo == nil && m.Spec.Receive != nil)
+func (m *VirtualMachineInstanceMigration) IsDecentralizedSource() bool {
+	return m.IsDecentralized() && m.Spec.SendTo != nil
+}
+
+func (m *VirtualMachineInstanceMigration) IsLocalOrDecentralizedTarget() bool {
+	return !m.IsDecentralized() || m.Spec.Receive != nil
+}
+
+func (m *VirtualMachineInstanceMigration) IsDecentralizedTarget() bool {
+	return m.IsDecentralized() && m.Spec.Receive != nil
 }
 
 func (m *VirtualMachineInstanceMigration) IsDecentralized() bool {
@@ -1688,6 +1763,9 @@ const (
 	// VMI will run once and not be restarted upon completion regardless
 	// if the completion is of phase Failure or Success
 	RunStrategyOnce VirtualMachineRunStrategy = "Once"
+	// Receiver pod will be created waiting for an incoming migration. Switch after to expected
+	// RunStrategy.
+	RunStrategyWaitAsReceiver VirtualMachineRunStrategy = "WaitAsReceiver"
 )
 
 type UpdateVolumesStrategy string
@@ -1781,6 +1859,9 @@ const (
 	// VirtualMachineStatusWaitingForVolumeBinding indicates that some PersistentVolumeClaims backing
 	// the virtual machine volume are still not bound.
 	VirtualMachineStatusWaitingForVolumeBinding VirtualMachinePrintableStatus = "WaitingForVolumeBinding"
+	// VirtualMachineStatusWaitingForReceiver indicates that this virtual machine is a receiver VM and
+	// migration should start next.
+	VirtualMachineStatusWaitingForReceiver VirtualMachinePrintableStatus = "WaitingForReceiver"
 )
 
 // VirtualMachineStartFailure tracks VMIs which failed to transition successfully
@@ -2303,7 +2384,8 @@ type KubeVirtStatus struct {
 	ObservedGeneration                      *int64              `json:"observedGeneration,omitempty"`
 	DefaultArchitecture                     string              `json:"defaultArchitecture,omitempty"`
 	// +listType=atomic
-	Generations []GenerationStatus `json:"generations,omitempty" optional:"true"`
+	Generations            []GenerationStatus `json:"generations,omitempty" optional:"true"`
+	SynchronizationAddress *string            `json:"synchronizationAddress,omitempty"`
 }
 
 // KubeVirtPhase is a label for the phase of a KubeVirt deployment at the current time.
@@ -3385,4 +3467,26 @@ type SEVSecretOptions struct {
 	Header string `json:"header,omitempty"`
 	// Base64 encoded encrypted launch secret.
 	Secret string `json:"secret,omitempty"`
+}
+
+// ObjectGraphNode represents an individual node in the graph.
+//
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+type ObjectGraphNode struct {
+	metav1.TypeMeta `json:",inline"`
+	ObjectReference k8sv1.TypedObjectReference `json:"objectReference"`
+	Labels          map[string]string          `json:"labels,omitempty"`
+	// +optional
+	Optional *bool `json:"optional,omitempty"`
+	// +listType=atomic
+	Children []ObjectGraphNode `json:"children,omitempty"`
+}
+
+// ObjectGraphOptions holds options for the object graph.
+type ObjectGraphOptions struct {
+	// IncludeOptionalNodes indicates whether to include optional nodes in the graph.
+	// True by default.
+	IncludeOptionalNodes *bool `json:"includeOptionalNodes,omitempty"`
+	// LabelSelector is used to filter nodes in the graph based on their labels.
+	LabelSelector *metav1.LabelSelector `json:"labelSelector,omitempty"`
 }

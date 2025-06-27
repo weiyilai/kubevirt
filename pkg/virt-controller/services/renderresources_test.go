@@ -358,10 +358,8 @@ var _ = Describe("Resource pod spec renderer", func() {
 		kvConfig.SupportContainerResources[0].Resources.Requests = req
 		kvConfig.SupportContainerResources[0].Resources.Limits = lim
 		clusterConfig, _, _ := testutils.NewFakeClusterConfigUsingKVConfig(kvConfig)
-		vmi := &v1.VirtualMachineInstance{
-			Spec: v1.VirtualMachineInstanceSpec{},
-		}
-		res := hotplugContainerResourceRequirementsForVMI(vmi, clusterConfig)
+
+		res := hotplugContainerResourceRequirementsForVMI(clusterConfig)
 		Expect(res.Requests).To(BeEquivalentTo(expectedReq))
 		Expect(res.Limits).To(BeEquivalentTo(expectedLim))
 	},
@@ -478,7 +476,7 @@ var _ = Describe("GetMemoryOverhead calculation", func() {
 		// MemoryReq / 512bit
 		baseOverhead = pointer.P(resource.MustParse("7Mi"))
 		coresOverhead = pointer.P(resource.MustParse("8Mi"))
-		videoRAMOverhead = pointer.P(resource.MustParse("16Mi"))
+		videoRAMOverhead = pointer.P(resource.MustParse("32Mi"))
 		cpuArchOverhead = pointer.P(resource.MustParse("128Mi"))
 		vfioOverhead = pointer.P(resource.MustParse("1Gi"))
 		downwardmetricsOverhead = pointer.P(resource.MustParse("1Mi"))

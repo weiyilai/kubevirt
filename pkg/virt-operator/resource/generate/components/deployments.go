@@ -571,6 +571,20 @@ func NewOperatorDeployment(namespace, repository, imagePrefix, version, verbosit
 									ContainerPort: 8444,
 								},
 							},
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Scheme: corev1.URISchemeHTTPS,
+										Port: intstr.IntOrString{
+											Type:   intstr.Int,
+											IntVal: 8443,
+										},
+										Path: "/metrics",
+									},
+								},
+								InitialDelaySeconds: 5,
+								TimeoutSeconds:      10,
+							},
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									HTTPGet: &corev1.HTTPGetAction{
@@ -744,11 +758,14 @@ func NewSynchronizationControllerDeployment(
 			},
 		},
 	})
+
 	deployment := newBaseDeployment(deploymentName, imageName, namespace, repository, version, productName, productVersion, productComponent, image, pullPolicy, imagePullSecrets, podAntiAffinity, env)
 
 	if deployment.Spec.Template.Annotations == nil {
 		deployment.Spec.Template.Annotations = make(map[string]string)
 	}
+	// remove the prometheus label key, so prometheus doesn't try to scrape anything of the synchronization controller.
+	delete(deployment.Spec.Template.Labels, prometheusLabelKey)
 	deployment.Spec.Template.Annotations["openshift.io/required-scc"] = "restricted-v2"
 	if migrationNetwork != nil {
 		// Join the pod to the migration network and name the corresponding interface "migration0"
