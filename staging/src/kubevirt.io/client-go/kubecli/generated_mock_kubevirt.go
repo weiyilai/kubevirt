@@ -1535,6 +1535,21 @@ func (mr *MockVirtualMachineInstanceInterfaceMockRecorder) List(ctx, opts any) *
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "List", reflect.TypeOf((*MockVirtualMachineInstanceInterface)(nil).List), ctx, opts)
 }
 
+// ObjectGraph mocks base method.
+func (m *MockVirtualMachineInstanceInterface) ObjectGraph(ctx context.Context, name string, objectGraphOptions *v121.ObjectGraphOptions) (v121.ObjectGraphNode, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ObjectGraph", ctx, name, objectGraphOptions)
+	ret0, _ := ret[0].(v121.ObjectGraphNode)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ObjectGraph indicates an expected call of ObjectGraph.
+func (mr *MockVirtualMachineInstanceInterfaceMockRecorder) ObjectGraph(ctx, name, objectGraphOptions any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ObjectGraph", reflect.TypeOf((*MockVirtualMachineInstanceInterface)(nil).ObjectGraph), ctx, name, objectGraphOptions)
+}
+
 // Patch mocks base method.
 func (m *MockVirtualMachineInstanceInterface) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts v12.PatchOptions, subresources ...string) (*v121.VirtualMachineInstance, error) {
 	m.ctrl.T.Helper()
@@ -1770,21 +1785,6 @@ func (m *MockVirtualMachineInstanceInterface) Update(ctx context.Context, virtua
 func (mr *MockVirtualMachineInstanceInterfaceMockRecorder) Update(ctx, virtualMachineInstance, opts any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Update", reflect.TypeOf((*MockVirtualMachineInstanceInterface)(nil).Update), ctx, virtualMachineInstance, opts)
-}
-
-// UpdateStatus mocks base method.
-func (m *MockVirtualMachineInstanceInterface) UpdateStatus(ctx context.Context, virtualMachineInstance *v121.VirtualMachineInstance, opts v12.UpdateOptions) (*v121.VirtualMachineInstance, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "UpdateStatus", ctx, virtualMachineInstance, opts)
-	ret0, _ := ret[0].(*v121.VirtualMachineInstance)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// UpdateStatus indicates an expected call of UpdateStatus.
-func (mr *MockVirtualMachineInstanceInterfaceMockRecorder) UpdateStatus(ctx, virtualMachineInstance, opts any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateStatus", reflect.TypeOf((*MockVirtualMachineInstanceInterface)(nil).UpdateStatus), ctx, virtualMachineInstance, opts)
 }
 
 // UserList mocks base method.
@@ -2353,6 +2353,21 @@ func (m *MockVirtualMachineInterface) Migrate(ctx context.Context, name string, 
 func (mr *MockVirtualMachineInterfaceMockRecorder) Migrate(ctx, name, migrateOptions any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Migrate", reflect.TypeOf((*MockVirtualMachineInterface)(nil).Migrate), ctx, name, migrateOptions)
+}
+
+// ObjectGraph mocks base method.
+func (m *MockVirtualMachineInterface) ObjectGraph(ctx context.Context, name string, objectGraphOptions *v121.ObjectGraphOptions) (v121.ObjectGraphNode, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ObjectGraph", ctx, name, objectGraphOptions)
+	ret0, _ := ret[0].(v121.ObjectGraphNode)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ObjectGraph indicates an expected call of ObjectGraph.
+func (mr *MockVirtualMachineInterfaceMockRecorder) ObjectGraph(ctx, name, objectGraphOptions any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ObjectGraph", reflect.TypeOf((*MockVirtualMachineInterface)(nil).ObjectGraph), ctx, name, objectGraphOptions)
 }
 
 // Patch mocks base method.

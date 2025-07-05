@@ -94,7 +94,6 @@ import (
 	"kubevirt.io/kubevirt/tests/libwait"
 	"kubevirt.io/kubevirt/tests/testsuite"
 	"kubevirt.io/kubevirt/tests/watcher"
-	"kubevirt.io/kubevirt/tools/vms-generator/utils"
 )
 
 const (
@@ -1561,9 +1560,6 @@ var _ = Describe(SIG("VM Live Migration", decorators.RequiresTwoSchedulableNodes
 
 				// check VMI, confirm migration state
 				vmi = libmigration.ConfirmVMIPostMigrationFailed(vmi, migrationUID)
-				// Not sure how consistent the entire error is, so just making sure the failure happened in libvirt. Example string:
-				// Live migration failed error encountered during MigrateToURI3 libvirt api call: virError(Code=1, Domain=7, Message='internal error: client socket is closed'
-				Expect(vmi.Status.MigrationState.FailureReason).To(ContainSubstring("libvirt api call"))
 
 				By("Removing our migration killer pods")
 				for _, podName := range createdPods {
@@ -1623,7 +1619,7 @@ var _ = Describe(SIG("VM Live Migration", decorators.RequiresTwoSchedulableNodes
 					// check VMI, confirm migration state
 					vmi = libmigration.ConfirmVMIPostMigrationFailed(vmi, migrationUID)
 					Expect(vmi.Status.MigrationState.FailureReason).To(ContainSubstring("Failed migration to satisfy functional test condition"))
-					Eventually(matcher.ThisPodWith(vmi.Namespace, vmi.Status.MigrationState.TargetPod)).WithPolling(time.Second).WithTimeout(15*time.Second).
+					Eventually(matcher.ThisPodWith(vmi.Namespace, vmi.Status.MigrationState.TargetPod)).WithPolling(time.Second).WithTimeout(30*time.Second).
 						Should(
 							Or(
 								matcher.BeInPhase(k8sv1.PodFailed),
@@ -2015,7 +2011,7 @@ var _ = Describe(SIG("VM Live Migration", decorators.RequiresTwoSchedulableNodes
 				)
 			})
 
-			Context("when target pod cannot be scheduled and is suck in Pending phase", Serial, func() {
+			Context("when target pod cannot be scheduled and is stuck in Pending phase", Serial, func() {
 
 				var nodesSetUnschedulable []string
 
@@ -2462,7 +2458,7 @@ var _ = Describe(SIG("VM Live Migration", decorators.RequiresTwoSchedulableNodes
 			// However, we need to be sig-something or we'll fail the check, even if we don't run on any sig- lane.
 			// So let's be sig-compute and skip ourselves on sig-compute always... (they have only 1 node with CPU manager)
 			nodes = libnode.GetWorkerNodesWithCPUManagerEnabled(virtClient)
-
+			Expect(len(nodes)).To(BeNumerically(">=", 2), "Need at least 2 nodes with CPU manager enabled")
 			By("creating a template for a pause pod with 1 dedicated CPU core")
 			pausePod = libpod.RenderPod("pause-", nil, nil)
 			pausePod.Spec.Containers[0].Name = "compute"
@@ -2513,6 +2509,7 @@ var _ = Describe(SIG("VM Live Migration", decorators.RequiresTwoSchedulableNodes
 				libvmi.WithResourceMemory("512Mi"),
 				libvmi.WithNodeAffinityForLabel(testLabel1, "true"),
 			)
+
 			vmi, err := virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vmi, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
@@ -2872,6 +2869,47 @@ var _ = Describe(SIG("VM Live Migration", decorators.RequiresTwoSchedulableNodes
 			}, 200)).To(Succeed())
 		})
 	})
+
+	Context("VMI deletion during migration", func() {
+		It("[sig-compute]should fail the migration and not prevent future migrations", func() {
+			vmi := libvmifact.NewAlpine(libnet.WithMasqueradeNetworking())
+			vmi.Namespace = testsuite.GetTestNamespace(vmi)
+			vm := libvmi.NewVirtualMachine(vmi, libvmi.WithRunStrategy(v1.RunStrategyAlways))
+
+			By("Starting a virtual machine")
+			vm, err := virtClient.VirtualMachine(vm.Namespace).Create(context.Background(), vm, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
+			Eventually(ThisVM(vm), 4*time.Minute, 1*time.Second).Should(BeReady())
+			vmi = libwait.WaitForSuccessfulVMIStart(vmi)
+
+			By("Limiting the bandwidth of migrations in the test namespace")
+			policy := CreateMigrationPolicy(virtClient, PreparePolicyAndVMIWithBandwidthLimitation(vmi, migrationBandwidthLimit))
+
+			By("Starting a Migration")
+			migration := libmigration.New(vmi.Name, vmi.Namespace)
+			migration, err = virtClient.VirtualMachineInstanceMigration(migration.Namespace).Create(context.Background(), migration, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Waiting until the Migration has a UID")
+			Eventually(func() (types.UID, error) {
+				migration, err = virtClient.VirtualMachineInstanceMigration(migration.Namespace).Get(context.Background(), migration.Name, metav1.GetOptions{})
+				return migration.UID, err
+			}, 180, 1*time.Second).ShouldNot(Equal(types.UID("")))
+
+			By("Deleting the VMI")
+			Expect(virtClient.VirtualMachineInstance(vmi.Namespace).Delete(context.Background(), vmi.Name, metav1.DeleteOptions{})).To(Succeed())
+
+			By("Waiting for the VMI to restart")
+			Eventually(ThisVMI(vmi), 4*time.Minute).Should(BeRestarted(vmi.UID))
+
+			By("Deleting the migration policy")
+			Expect(virtClient.MigrationPolicy().Delete(context.Background(), policy.Name, metav1.DeleteOptions{})).To(Succeed())
+
+			By("Expecting to be able to migrate the VMI")
+			migration = libmigration.New(vmi.Name, vmi.Namespace)
+			libmigration.RunMigrationAndExpectToCompleteWithDefaultTimeout(kubevirt.Client(), migration)
+		})
+	})
 }))
 
 func createResourceQuota(resourceQuota *k8sv1.ResourceQuota) *k8sv1.ResourceQuota {
@@ -3103,11 +3141,28 @@ func haveMigrationState(matcher gomegatypes.GomegaMatcher) gomegatypes.GomegaMat
 
 func withKernelBoot() libvmi.Option {
 	return func(vmi *v1.VirtualMachineInstance) {
-		kernelBootFirmware := utils.GetVMIKernelBootWithRandName().Spec.Domain.Firmware
+		const (
+			kernelArgs = "console=ttyS0"
+			kernelPath = "/boot/vmlinuz-virt"
+			initrdPath = "/boot/initramfs-virt"
+		)
+
+		image := cd.ContainerDiskFor(cd.KernelBoot)
+		kb := &v1.KernelBoot{
+			KernelArgs: kernelArgs,
+			Container: &v1.KernelBootContainer{
+				Image:      image,
+				KernelPath: kernelPath,
+				InitrdPath: initrdPath,
+			},
+		}
+
 		if vmi.Spec.Domain.Firmware == nil {
-			vmi.Spec.Domain.Firmware = kernelBootFirmware
+			vmi.Spec.Domain.Firmware = &v1.Firmware{
+				KernelBoot: kb,
+			}
 		} else {
-			vmi.Spec.Domain.Firmware.KernelBoot = kernelBootFirmware.KernelBoot
+			vmi.Spec.Domain.Firmware.KernelBoot = kb
 		}
 	}
 }

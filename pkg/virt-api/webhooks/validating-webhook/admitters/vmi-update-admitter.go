@@ -130,25 +130,39 @@ func (admitter *VMIUpdateAdmitter) Admit(_ context.Context, ar *admissionv1.Admi
 	}
 }
 
-func getExpectedDisksAndFilesystems(newVolumes []v1.Volume) int {
-	numMemoryDumpVolumes := 0
-	for _, volume := range newVolumes {
-		if volume.MemoryDump != nil {
-			numMemoryDumpVolumes = numMemoryDumpVolumes + 1
+func validateExpectedDisksAndFilesystems(volumes []v1.Volume, disks []v1.Disk, filesystems []v1.Filesystem, config *virtconfig.ClusterConfig) error {
+	names := make(map[string]struct{})
+	for _, volume := range volumes {
+		if volume.MemoryDump == nil {
+			names[volume.Name] = struct{}{}
 		}
 	}
-	return len(newVolumes) - numMemoryDumpVolumes
+
+	requiredVolumes := len(filesystems)
+	for _, disk := range disks {
+		_, ok := names[disk.Name]
+		// it's okay for a CDRom to not be mapped to a volume
+		if !ok && disk.CDRom != nil && config.DeclarativeHotplugVolumesEnabled() {
+			continue
+		}
+		requiredVolumes++
+	}
+
+	// Make sure volume is not mapped to multiple disks/filesystems or volume mapped to nothing
+	if requiredVolumes != len(names) {
+		return fmt.Errorf("mismatch between volumes declared (%d) and required (%d)", len(names), requiredVolumes)
+	}
+
+	return nil
 }
 
 // admitStorageUpdate compares the old and new volumes and disks, and ensures that they match and are valid.
 func admitStorageUpdate(newVolumes, oldVolumes []v1.Volume, newDisks, oldDisks []v1.Disk, volumeStatuses []v1.VolumeStatus, newVMI *v1.VirtualMachineInstance, config *virtconfig.ClusterConfig) *admissionv1.AdmissionResponse {
-	expectedDisksAndFilesystems := getExpectedDisksAndFilesystems(newVolumes)
-	observedDisksAndFilesystems := len(newDisks) + len(newVMI.Spec.Domain.Devices.Filesystems)
-	if expectedDisksAndFilesystems != observedDisksAndFilesystems {
+	if err := validateExpectedDisksAndFilesystems(newVolumes, newDisks, newVMI.Spec.Domain.Devices.Filesystems, config); err != nil {
 		return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
 			{
 				Type:    metav1.CauseTypeFieldValueInvalid,
-				Message: fmt.Sprintf("number of disks and filesystems (%d) does not equal the number of volumes (%d)", observedDisksAndFilesystems, expectedDisksAndFilesystems),
+				Message: err.Error(),
 			},
 		})
 	}
@@ -198,7 +212,7 @@ func verifyHotplugVolumes(newHotplugVolumeMap, oldHotplugVolumeMap map[string]v1
 					return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
 						{
 							Type:    metav1.CauseTypeFieldValueInvalid,
-							Message: fmt.Sprintf("Volume %s doesn't have a matching disk", k),
+							Message: fmt.Sprintf("volume %s doesn't have a matching disk", k),
 						},
 					})
 				}
@@ -222,40 +236,21 @@ func verifyHotplugVolumes(newHotplugVolumeMap, oldHotplugVolumeMap map[string]v1
 				})
 			}
 			if v.MemoryDump == nil {
-				// Also ensure the matching new disk exists and is of type scsi
+				// Also ensure the matching new disk exists and has a valid bus
 				if _, ok := newDisks[k]; !ok {
 					return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
 						{
 							Type:    metav1.CauseTypeFieldValueInvalid,
-							Message: fmt.Sprintf("Disk %s does not exist", k),
+							Message: fmt.Sprintf("disk %s does not exist", k),
 						},
 					})
 				}
 				disk := newDisks[k]
-				if disk.Disk == nil && disk.LUN == nil {
-					return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
-						{
-							Type:    metav1.CauseTypeFieldValueInvalid,
-							Message: fmt.Sprintf("Disk %s requires diskDevice of type 'disk' or 'lun' to be hotplugged.", k),
-						},
-					})
-				}
-				if (disk.Disk == nil || disk.Disk.Bus != "scsi") && (disk.LUN == nil || disk.LUN.Bus != "scsi") {
-					return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
-						{
-							Type:    metav1.CauseTypeFieldValueInvalid,
-							Message: fmt.Sprintf("hotplugged Disk %s does not use a scsi bus", k),
-						},
-					})
-
-				}
-				if disk.DedicatedIOThread != nil && *disk.DedicatedIOThread {
-					return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
-						{
-							Type:    metav1.CauseTypeFieldValueInvalid,
-							Message: fmt.Sprintf("hotplugged Disk %s can't use dedicated IOThread: scsi bus is unsupported.", k),
-						},
-					})
+				if _, ok := oldDisks[k]; !ok {
+					causes := validateHotplugDiskConfiguration(&disk, k, "Hotplug configuration", "")
+					if len(causes) > 0 {
+						return webhookutils.ToAdmissionResponse(causes)
+					}
 				}
 			}
 		}

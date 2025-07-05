@@ -1,3 +1,4 @@
+cmd/cniplugins
 cmd/virtctl
 pkg/instancetype
 pkg/libvmi
@@ -8,11 +9,13 @@ pkg/network/domainspec
 pkg/network/downwardapi
 pkg/network/errors
 pkg/network/istio
+pkg/network/migration
 pkg/network/multus
 pkg/network/namescheme
 pkg/network/netbinding
 pkg/network/netmachinery
 pkg/network/netns
+pkg/network/passt
 pkg/network/pod/annotations
 pkg/network/vmispec
 pkg/network/vmliveupdate

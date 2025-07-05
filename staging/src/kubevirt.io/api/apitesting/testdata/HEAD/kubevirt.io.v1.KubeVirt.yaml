@@ -69,6 +69,11 @@ spec:
         - emulatedMachinesValue
         machineType: machineTypeValue
         ovmfPath: ovmfPathValue
+      s390x:
+        emulatedMachines:
+        - emulatedMachinesValue
+        machineType: machineTypeValue
+        ovmfPath: ovmfPathValue
     autoCPULimitNamespaceLabelSelector:
       matchExpressions:
       - key: keyValue
@@ -572,6 +577,8 @@ status:
   operatorVersion: operatorVersionValue
   outdatedVirtualMachineInstanceWorkloads: -39
   phase: phaseValue
+  synchronizationAddresses:
+  - synchronizationAddressesValue
   targetDeploymentConfig: targetDeploymentConfigValue
   targetDeploymentID: targetDeploymentIDValue
   targetKubeVirtRegistry: targetKubeVirtRegistryValue

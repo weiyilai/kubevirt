@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 
 	"kubevirt.io/kubevirt/pkg/storage/utils"
@@ -41,6 +42,7 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 
 	"kubevirt.io/kubevirt/pkg/downwardmetrics"
+	draadmitter "kubevirt.io/kubevirt/pkg/dra/admitter"
 	"kubevirt.io/kubevirt/pkg/hooks"
 	netadmitter "kubevirt.io/kubevirt/pkg/network/admitter"
 	"kubevirt.io/kubevirt/pkg/network/vmispec"
@@ -77,6 +79,7 @@ const (
 
 var validIOThreadsPolicies = []v1.IOThreadsPolicy{v1.IOThreadsPolicyShared, v1.IOThreadsPolicyAuto, v1.IOThreadsPolicySupplementalPool}
 var validCPUFeaturePolicies = map[string]*struct{}{"": nil, "force": nil, "require": nil, "optional": nil, "disable": nil, "forbid": nil}
+var validPanicDeviceModels = []v1.PanicDeviceModel{v1.Hyperv, v1.Isa, v1.Pvpanic}
 
 var restrictedVmiLabels = map[string]bool{
 	v1.CreatedByLabel:               true,
@@ -93,6 +96,8 @@ const (
 )
 
 var isValidExpression = regexp.MustCompile(`^[A-Za-z0-9_.+-]+$`).MatchString
+
+var invalidPanicDeviceModelErrFmt = "invalid PanicDeviceModel(%s)"
 
 // SpecValidator validates the given VMI spec
 type SpecValidator func(*k8sfield.Path, *v1.VirtualMachineInstanceSpec, *virtconfig.ClusterConfig) []metav1.StatusCause
@@ -166,6 +171,8 @@ func ValidateVirtualMachineInstancePerArch(field *k8sfield.Path, spec *v1.Virtua
 		causes = append(causes, webhooks.ValidateVirtualMachineInstanceS390XSetting(field, spec)...)
 	case "arm64":
 		causes = append(causes, webhooks.ValidateVirtualMachineInstanceArm64Setting(field, spec)...)
+	case "ppc64le":
+		causes = append(causes, webhooks.ValidateVirtualMachineInstancePPC64LESetting(field, spec)...)
 	default:
 		causes = append(causes, metav1.StatusCause{
 			Type:    metav1.CauseTypeFieldValueInvalid,
@@ -179,7 +186,6 @@ func ValidateVirtualMachineInstancePerArch(field *k8sfield.Path, spec *v1.Virtua
 
 func ValidateVirtualMachineInstanceSpec(field *k8sfield.Path, spec *v1.VirtualMachineInstanceSpec, config *virtconfig.ClusterConfig) []metav1.StatusCause {
 	var causes []metav1.StatusCause
-	volumeNameMap := make(map[string]*v1.Volume)
 
 	causes = append(causes, validateHostNameNotConformingToDNSLabelRules(field, spec)...)
 	causes = append(causes, validateSubdomainDNSSubdomainRules(field, spec)...)
@@ -207,7 +213,9 @@ func ValidateVirtualMachineInstanceSpec(field *k8sfield.Path, spec *v1.VirtualMa
 	netValidator := netadmitter.NewValidator(field, spec, config)
 	causes = append(causes, netValidator.Validate()...)
 
-	causes = append(causes, validateBootOrder(field, spec, volumeNameMap)...)
+	causes = append(causes, draadmitter.ValidateCreation(field, spec, config)...)
+
+	causes = append(causes, validateBootOrder(field, spec, config)...)
 
 	causes = append(causes, validateInputDevices(field, spec)...)
 	causes = append(causes, validateIOThreadsPolicy(field, spec)...)
@@ -238,6 +246,8 @@ func ValidateVirtualMachineInstanceSpec(field *k8sfield.Path, spec *v1.VirtualMa
 	causes = append(causes, validatePersistentReservation(field, spec, config)...)
 	causes = append(causes, validateDownwardMetrics(field, spec, config)...)
 	causes = append(causes, validateFilesystemsWithVirtIOFSEnabled(field, spec, config)...)
+	causes = append(causes, validateVideoConfig(field, spec, config)...)
+	causes = append(causes, validatePanicDevices(field, spec, config)...)
 
 	return causes
 }
@@ -558,13 +568,23 @@ func validateSoundDevices(field *k8sfield.Path, spec *v1.VirtualMachineInstanceS
 func validateLaunchSecurity(field *k8sfield.Path, spec *v1.VirtualMachineInstanceSpec, config *virtconfig.ClusterConfig) []metav1.StatusCause {
 	var causes []metav1.StatusCause
 	launchSecurity := spec.Domain.LaunchSecurity
-	if launchSecurity != nil && !config.WorkloadEncryptionSEVEnabled() {
+	if launchSecurity == nil {
+		return causes
+	}
+	if !config.SecureExecutionEnabled() && webhooks.IsS390X(spec) {
+		causes = append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("%s feature gate is not enabled in kubevirt-config", featuregate.SecureExecution),
+			Field:   field.Child("launchSecurity").String(),
+		})
+	}
+	if !config.WorkloadEncryptionSEVEnabled() && launchSecurity.SEV != nil {
 		causes = append(causes, metav1.StatusCause{
 			Type:    metav1.CauseTypeFieldValueInvalid,
 			Message: fmt.Sprintf("%s feature gate is not enabled in kubevirt-config", featuregate.WorkloadEncryptionSEV),
 			Field:   field.Child("launchSecurity").String(),
 		})
-	} else if launchSecurity != nil && launchSecurity.SEV != nil {
+	} else if launchSecurity.SEV != nil {
 		firmware := spec.Domain.Firmware
 		if !efiBootEnabled(firmware) {
 			causes = append(causes, metav1.StatusCause{
@@ -602,10 +622,11 @@ func validateLaunchSecurity(field *k8sfield.Path, spec *v1.VirtualMachineInstanc
 	return causes
 }
 
-func validateBootOrder(field *k8sfield.Path, spec *v1.VirtualMachineInstanceSpec, volumeNameMap map[string]*v1.Volume) []metav1.StatusCause {
+func validateBootOrder(field *k8sfield.Path, spec *v1.VirtualMachineInstanceSpec, config *virtconfig.ClusterConfig) []metav1.StatusCause {
 	var causes []metav1.StatusCause
 	// used to validate uniqueness of boot orders among disks and interfaces
 	bootOrderMap := make(map[uint]bool)
+	volumeNameMap := make(map[string]*v1.Volume)
 
 	for i, volume := range spec.Volumes {
 		volumeNameMap[volume.Name] = &spec.Volumes[i]
@@ -618,11 +639,19 @@ func validateBootOrder(field *k8sfield.Path, spec *v1.VirtualMachineInstanceSpec
 		matchingVolume, volumeExists := volumeNameMap[disk.Name]
 
 		if !volumeExists {
-			causes = append(causes, metav1.StatusCause{
-				Type:    metav1.CauseTypeFieldValueInvalid,
-				Message: fmt.Sprintf(nameOfTypeNotFoundMessagePattern, field.Child("domain", "devices", "disks").Index(idx).Child("Name").String(), disk.Name),
-				Field:   field.Child("domain", "devices", "disks").Index(idx).Child("name").String(),
-			})
+			if disk.CDRom == nil {
+				causes = append(causes, metav1.StatusCause{
+					Type:    metav1.CauseTypeFieldValueInvalid,
+					Message: fmt.Sprintf(nameOfTypeNotFoundMessagePattern, field.Child("domain", "devices", "disks").Index(idx).Child("Name").String(), disk.Name),
+					Field:   field.Child("domain", "devices", "disks").Index(idx).Child("name").String(),
+				})
+			} else if !config.DeclarativeHotplugVolumesEnabled() {
+				causes = append(causes, metav1.StatusCause{
+					Type:    metav1.CauseTypeFieldValueInvalid,
+					Message: fmt.Sprintf("%s feature gate not enabled, cannot define an empty CD-ROM disk", featuregate.DeclarativeHotplugVolumesGate),
+					Field:   field.Child("domain", "devices", "disks").Index(idx).Child("name").String(),
+				})
+			}
 		}
 
 		// Verify Lun disks are only mapped to network/block devices.
@@ -1440,30 +1469,45 @@ func validateFirmwareACPI(field *k8sfield.Path, spec *v1.VirtualMachineInstanceS
 	}
 
 	acpi := spec.Domain.Firmware.ACPI
-	for _, volume := range spec.Volumes {
-		if acpi.SlicNameRef != volume.Name {
+	if acpi.SlicNameRef == "" && acpi.MsdmNameRef == "" {
+		return append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("ACPI was set but no SLIC nor MSDM volume reference was set"),
+			Field:   field.String(),
+		})
+	}
+
+	causes = append(causes, validateACPIRef(field, acpi.SlicNameRef, spec.Volumes, "slicNameRef")...)
+	causes = append(causes, validateACPIRef(field, acpi.MsdmNameRef, spec.Volumes, "msdmNameRef")...)
+	return causes
+}
+
+func validateACPIRef(field *k8sfield.Path, nameRef string, volumes []v1.Volume, fieldName string) []metav1.StatusCause {
+	if nameRef == "" {
+		return nil
+	}
+
+	for _, volume := range volumes {
+		if nameRef != volume.Name {
 			continue
 		}
 
-		switch {
-		case volume.Secret != nil:
-		default:
-			causes = append(causes, metav1.StatusCause{
-				Type:    metav1.CauseTypeFieldValueInvalid,
-				Message: fmt.Sprintf("%s refers to Volume of unsupported type.", field.String()),
-				Field:   field.Child("slicNameRef").String(),
-			})
+		if volume.Secret != nil {
+			return nil
 		}
-		return causes
+
+		return []metav1.StatusCause{{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("%s refers to Volume of unsupported type.", field.String()),
+			Field:   field.Child(fieldName).String(),
+		}}
 	}
 
-	causes = append(causes, metav1.StatusCause{
+	return []metav1.StatusCause{{
 		Type:    metav1.CauseTypeFieldValueInvalid,
 		Message: fmt.Sprintf("%s does not have a matching Volume.", field.String()),
-		Field:   field.String(),
-	})
-
-	return causes
+		Field:   field.Child(fieldName).String(),
+	}}
 }
 
 func validateFirmware(field *k8sfield.Path, firmware *v1.Firmware) []metav1.StatusCause {
@@ -2370,5 +2414,82 @@ func validateCPUHotplug(field *k8sfield.Path, spec *v1.VirtualMachineInstanceSpe
 			})
 		}
 	}
+	return causes
+}
+
+func validateVideoConfig(field *k8sfield.Path, spec *v1.VirtualMachineInstanceSpec, config *virtconfig.ClusterConfig) []metav1.StatusCause {
+	var causes []metav1.StatusCause
+
+	if spec.Domain.Devices.Video == nil {
+		return causes
+	}
+
+	if !config.VideoConfigEnabled() {
+		causes = append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("Video configuration is specified but the %s feature gate is not enabled", featuregate.VideoConfig),
+			Field:   field.Child("video").String(),
+		})
+		return causes
+	}
+
+	if spec.Domain.Devices.AutoattachGraphicsDevice != nil && !*spec.Domain.Devices.AutoattachGraphicsDevice {
+		causes = append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: "Video configuration is not allowed when autoattachGraphicsDevice is set to false",
+			Field:   field.Child("video").String(),
+		})
+	}
+
+	return causes
+}
+
+func validatePanicDeviceModel(field *k8sfield.Path, model *v1.PanicDeviceModel) *metav1.StatusCause {
+	if model == nil {
+		return nil
+	}
+	if !slices.Contains(validPanicDeviceModels, *model) {
+		return &metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf(invalidPanicDeviceModelErrFmt, *model),
+			Field:   field.String(),
+		}
+	}
+	return nil
+}
+
+func validatePanicDevices(field *k8sfield.Path, spec *v1.VirtualMachineInstanceSpec, config *virtconfig.ClusterConfig) []metav1.StatusCause {
+	var causes []metav1.StatusCause
+	if len(spec.Domain.Devices.PanicDevices) == 0 {
+		return causes
+	}
+	if spec.Domain.Devices.PanicDevices != nil && !config.PanicDevicesEnabled() {
+		causes = append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: "Panic Devices feature gate is not enabled in kubevirt-config",
+			Field:   field.Child("domain", "devices", "panicDevices").String(),
+		})
+		return causes
+	}
+
+	arch := spec.Architecture
+	if arch == "" {
+		arch = config.GetDefaultArchitecture()
+	}
+
+	if arch == "s390x" || arch == "ppc64le" {
+		causes = append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("custom panic devices are not supported on %s architecture", arch),
+			Field:   field.Child("domain", "devices", "panicDevices").String(),
+		})
+	}
+
+	for idx, panicDevice := range spec.Domain.Devices.PanicDevices {
+		if cause := validatePanicDeviceModel(field.Child("domain", "devices", "panicDevices").Index(idx).Child("model"), panicDevice.Model); cause != nil {
+			causes = append(causes, *cause)
+		}
+	}
+
 	return causes
 }

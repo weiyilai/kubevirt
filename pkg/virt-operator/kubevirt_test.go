@@ -40,6 +40,7 @@ import (
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	k8sv1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -188,6 +189,7 @@ func (k *KubeVirtTestData) BeforeTest() {
 	informers.ValidatingAdmissionPolicy, _ = testutils.NewFakeInformerFor(&admissionregistrationv1.ValidatingAdmissionPolicy{})
 	informers.ClusterInstancetype, _ = testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterInstancetype{})
 	informers.ClusterPreference, _ = testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterPreference{})
+	informers.Leases, _ = testutils.NewFakeInformerFor(&coordinationv1.Lease{})
 
 	// test OpenShift components
 	config := util.OperatorConfig{
@@ -254,6 +256,15 @@ func (k *KubeVirtTestData) BeforeTest() {
 		if action.GetVerb() == "create" && action.GetResource().Resource == "validatingadmissionpolicies" {
 			dummyValidatingAdmissionPolicy := &admissionregistrationv1.ValidatingAdmissionPolicy{}
 			return true, dummyValidatingAdmissionPolicy, nil
+		}
+
+		if action.GetVerb() == "create" && action.GetResource().Resource == "configmaps" {
+			dummyConfigMap := &k8sv1.ConfigMap{}
+			return true, dummyConfigMap, nil
+		}
+
+		if action.GetVerb() == "update" && action.GetResource().Resource == "configmaps" {
+			return true, nil, nil
 		}
 
 		if action.GetVerb() == "get" && action.GetResource().Resource == "serviceaccounts" {
@@ -2433,8 +2444,9 @@ var _ = Describe("KubeVirt Operator", func() {
 
 			// 1 because a temporary validation webhook is created to block new CRDs until api server is deployed
 			expectedTemporaryResources := 1
+			externalCAConfigMapCount := 1
 
-			Expect(kvTestData.totalAdds).To(Equal(resourceCount - expectedUncreatedResources + expectedTemporaryResources))
+			Expect(kvTestData.totalAdds).To(Equal(resourceCount - expectedUncreatedResources + expectedTemporaryResources + externalCAConfigMapCount))
 
 			Expect(kvTestData.controller.stores.ServiceAccountCache.List()).To(HaveLen(5))
 			Expect(kvTestData.controller.stores.ClusterRoleCache.List()).To(HaveLen(11))
