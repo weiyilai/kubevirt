@@ -46,8 +46,8 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/coreos/go-semver/semver"
-	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/google/go-github/v32/github"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 
 	appsv1 "k8s.io/api/apps/v1"
 	k8sv1 "k8s.io/api/core/v1"
