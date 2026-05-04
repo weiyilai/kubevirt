@@ -83,7 +83,7 @@ to each test's description in the code.
 
 #### Grace period
 
-After a quarantine PR (automatic or manual) is proposed there is a grace period
+After a quarantine PR (automatic or manual) is proposed, there is a grace period
 of 2 days to prepare and land a fix for a test in the batch. If at least 5
 consecutive executions with the fix pass the test can be removed from the batch.
 
