@@ -43,7 +43,6 @@ require (
 	github.com/openshift/client-go v0.0.0
 	github.com/openshift/library-go v0.0.0-20240502143225-f71afde059ac
 	github.com/operator-framework/operator-lifecycle-manager v0.0.0-20190725173916-b56e63a643cc
-	github.com/pkg/errors v0.9.1
 	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.80.1
 	github.com/prometheus/client_golang v1.22.0
 	github.com/prometheus/client_model v0.6.2
@@ -146,6 +145,7 @@ require (
 	github.com/openshift/custom-resource-status v1.1.2 // indirect
 	github.com/pierrec/lz4/v4 v4.1.18 // indirect
 	github.com/pkg/diff v0.0.0-20210226163009-20ebb0f2a09e // indirect
+	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/seccomp/libseccomp-golang v0.10.0 // indirect
